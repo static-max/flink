@@ -17,10 +17,16 @@
 package org.apache.flink.streaming.connectors.elasticsearch2;
 
 import com.google.common.collect.ImmutableList;
+
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.util.Preconditions;
+import org.elasticsearch.ElasticsearchTimeoutException;
+import org.elasticsearch.action.ActionRequest;
+import org.elasticsearch.action.IndicesRequest;
+import org.elasticsearch.action.UnavailableShardsException;
 import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkProcessor;
 import org.elasticsearch.action.bulk.BulkRequest;
@@ -28,6 +34,7 @@ import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.client.transport.TransportClient;
+import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.InetSocketTransportAddress;
@@ -35,6 +42,8 @@ import org.elasticsearch.common.transport.TransportAddress;
 import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
+import org.elasticsearch.transport.NodeNotConnectedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,7 +95,8 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 	public static final String CONFIG_KEY_BULK_FLUSH_MAX_ACTIONS = "bulk.flush.max.actions";
 	public static final String CONFIG_KEY_BULK_FLUSH_MAX_SIZE_MB = "bulk.flush.max.size.mb";
 	public static final String CONFIG_KEY_BULK_FLUSH_INTERVAL_MS = "bulk.flush.interval.ms";
-
+	public static final String CONFIG_KEY_CLIENT_PING_TIMEOUT_MS = "client.transport.ping_timeout";
+	
 	private static final long serialVersionUID = 1L;
 
 	private static final Logger LOG = LoggerFactory.getLogger(ElasticsearchSink.class);
@@ -123,14 +133,16 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 	private transient RequestIndexer requestIndexer;
 
 	/**
-	 * This is set from inside the BulkProcessor listener if there where failures in processing.
-	 */
-	private final AtomicBoolean hasFailure = new AtomicBoolean(false);
-
-	/**
 	 * This is set from inside the BulkProcessor listener if a Throwable was thrown during processing.
 	 */
 	private final AtomicReference<Throwable> failureThrowable = new AtomicReference<>();
+	
+	/**
+	 * When set to <code>true</code> and the bulk action fails, the error message will be checked for
+	 * common patterns like <i>timeout</i>, <i>UnavailableShardsException</i> or a full buffer queue on the node.
+	 * When a matching pattern is found, the bulk will be retried.
+	 */
+	protected boolean checkErrorAndRetryBulk = false;
 
 	/**
 	 * Creates a new ElasticsearchSink that connects to the cluster using a TransportClient.
@@ -141,6 +153,11 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 	 *
 	 */
 	public ElasticsearchSink(Map<String, String> userConfig, List<InetSocketAddress> transportAddresses, ElasticsearchSinkFunction<T> elasticsearchSinkFunction) {
+		if (!userConfig.containsKey(CONFIG_KEY_CLIENT_PING_TIMEOUT_MS)) {
+			// Rise timeout to avoid ReceiveTimeoutTransportException request_id [5502798] timed out after [5000ms]]
+			userConfig.put(CONFIG_KEY_CLIENT_PING_TIMEOUT_MS, "30s");
+		}
+		
 		this.userConfig = userConfig;
 		this.elasticsearchSinkFunction = elasticsearchSinkFunction;
 		Preconditions.checkArgument(transportAddresses != null && transportAddresses.size() > 0);
@@ -186,22 +203,41 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 
 			@Override
 			public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
-				if (response.hasFailures()) {
-					for (BulkItemResponse itemResp : response.getItems()) {
+				if (response.hasFailures()) { System.out.println("Failed");
+					BulkItemResponse itemResp;
+					for (int i = 0; i < response.getItems().length; i++) {
+						itemResp = response.getItems()[i];
 						if (itemResp.isFailed()) {
-							LOG.error("Failed to index document in Elasticsearch: " + itemResp.getFailureMessage());
-							failureThrowable.compareAndSet(null, new RuntimeException(itemResp.getFailureMessage()));
+							if (checkErrorAndRetryBulk && isRetryableCause(itemResp.getFailure().getCause())) { // Check if index request can be retried
+								LOG.debug("Retry request: {}", itemResp.getFailureMessage());
+								
+								ActionRequest<?> req = request.requests().get(i);
+								
+								// There is no waiting time between index requests, so this may produce additional pressure on cluster
+								bulkProcessor.add(req);
+								
+							} else { // Cannot retry action
+								LOG.error("Failed to index document in Elasticsearch: {}", itemResp.getFailureMessage());
+								failureThrowable.compareAndSet(null, new RuntimeException(itemResp.getFailureMessage()));	
+							}
 						}
 					}
-					hasFailure.set(true);
 				}
 			}
 
 			@Override
 			public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
-				LOG.error(failure.getMessage());
-				failureThrowable.compareAndSet(null, failure);
-				hasFailure.set(true);
+				if (checkErrorAndRetryBulk && isRetryableCause(failure)) {
+					LOG.debug("Retry bulk on throwable: {}", failure.getMessage());
+
+					for (ActionRequest<?> req : request.requests()) {
+						// There is no waiting time between index requests, so this may produce additional pressure on cluster
+						bulkProcessor.add(req);
+					}
+				} else { 
+					LOG.error("Failed to index bulk in Elasticsearch. {}", failure.getMessage());
+					failureThrowable.compareAndSet(null, failure);
+				}
 			}
 		});
 
@@ -226,6 +262,37 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 		bulkProcessor = bulkProcessorBuilder.build();
 		requestIndexer = new BulkProcessorIndexer(bulkProcessor);
 	}
+	
+	/**
+	 * Check if the cause is only temporary and thus retryable
+	 */
+	public static boolean isRetryableCause(Throwable throwable) {
+		boolean retry =
+				ExceptionUtils.indexOfThrowable(throwable, EsRejectedExecutionException.class) >= 0 || // Bulk index queue on node full*/
+				ExceptionUtils.indexOfThrowable(throwable, ElasticsearchTimeoutException.class) >= 0 || // ElasticsearchTimeoutException sounded good, not seen in stress tests yet
+				ExceptionUtils.indexOfThrowable(throwable, UnavailableShardsException.class) >= 0 || // Shard not available due to rebalancing or node down
+				ExceptionUtils.indexOfThrowable(throwable, ClusterBlockException.class) >= 0 || // Examples: "no master"
+				ExceptionUtils.indexOfThrowable(throwable, NodeNotConnectedException.class) >= 0; // Timeout from node and node has not reconnected yet
+				
+		//LOG.warn("Will "+ (retry ? "" : "not") +" retry", throwable);
+		return retry;
+	}
+	
+	/**
+	 * Tells if a failed bulk request will be retried on certain error messages.
+	 * @return
+	 */
+	public boolean getCheckErrorAndRetryBulk() {
+		return checkErrorAndRetryBulk;
+	}
+
+	/**
+	 * Set to <code>true</code> if the bulk request should be retried on certain error messages.
+	 * @param checkErrorAndRetryBulk
+	 */
+	public void setCheckErrorAndRetryBulk(boolean checkErrorAndRetryBulk) {
+		this.checkErrorAndRetryBulk = checkErrorAndRetryBulk;
+	}
 
 	@Override
 	public void invoke(T element) {
@@ -243,15 +310,12 @@ public class ElasticsearchSink<T> extends RichSinkFunction<T>  {
 			client.close();
 		}
 
-		if (hasFailure.get()) {
-			Throwable cause = failureThrowable.get();
-			if (cause != null) {
-				throw new RuntimeException("An error occured in ElasticsearchSink.", cause);
-			} else {
-				throw new RuntimeException("An error occured in ElasticsearchSink.");
-			}
+		Throwable cause = failureThrowable.get();
+		if (cause != null) {
+			throw new RuntimeException("An error occured in ElasticsearchSink.", cause);
+		} else {
+			throw new RuntimeException("An error occured in ElasticsearchSink.");
 		}
-
 	}
 
 }

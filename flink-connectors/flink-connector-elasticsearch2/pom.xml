@@ -30,8 +30,8 @@ under the License.
 		<relativePath>..</relativePath>
 	</parent>
 
-	<artifactId>flink-connector-elasticsearch2_2.10</artifactId>
-	<name>flink-connector-elasticsearch2</name>
+	<artifactId>flink-connector-elasticsearch2_2.10-sm</artifactId>
+	<name>flink-connector-elasticsearch2-sm</name>
 
 	<packaging>jar</packaging>
 
