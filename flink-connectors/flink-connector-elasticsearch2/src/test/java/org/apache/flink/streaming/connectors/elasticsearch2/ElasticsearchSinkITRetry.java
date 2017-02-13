@@ -90,7 +90,6 @@ public class ElasticsearchSinkITRetry {
 		transports.add(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 9300));
 
 		ElasticsearchSink sink = new ElasticsearchSink<>(config, transports, new TestElasticsearchSinkFunction());
-		sink.setCheckErrorAndRetryBulk(true);
 		source.addSink(sink);
 
 		ArrayList<Thread> threads = new ArrayList<Thread>();
