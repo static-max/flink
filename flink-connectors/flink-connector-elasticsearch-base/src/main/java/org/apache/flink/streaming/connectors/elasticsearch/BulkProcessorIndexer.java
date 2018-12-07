@@ -20,6 +20,7 @@ package org.apache.flink.streaming.connectors.elasticsearch;
 
 import org.elasticsearch.action.ActionRequest;
 import org.elasticsearch.action.bulk.BulkProcessor;
+import org.elasticsearch.action.index.IndexRequest;
 
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -47,7 +48,7 @@ class BulkProcessorIndexer implements RequestIndexer {
 			if (flushOnCheckpoint) {
 				numPendingRequestsRef.getAndIncrement();
 			}
-			this.bulkProcessor.add(actionRequest);
+			this.bulkProcessor.add((IndexRequest) actionRequest);
 		}
 	}
 }
